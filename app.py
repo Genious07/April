@@ -13,9 +13,6 @@ openai.api_key = os.getenv("OPENAI_API_KEY")
 app = Flask(__name__)
 CORS(app)  # Enable CORS
 
-@app.route('/')
-def home():
-    return render_template('index.html')
 
 @app.route('/generate', methods=['POST'])
 def generate_response():
