@@ -1,5 +1,10 @@
-Flask
+openai
+faiss-cpu
+numpy
+flask
 flask-cors
-openai==0.28.0
+pymongo
 python-dotenv
-gunicorn
+requests
+beautifulsoup4
+youtube-transcript-api
