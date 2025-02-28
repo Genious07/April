@@ -1,6 +1,6 @@
 fastapi
 uvicorn
-openai
+openai==0.28
 httpx
 motor
 python-dotenv
