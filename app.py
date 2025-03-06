@@ -85,24 +85,18 @@ def get_current_datetime() -> str:
 
 def filter_think_messages(messages: list) -> list:
     """
-    Filters out any messages that occur between a <think> and </think> marker.
-    Assumes each message is a dict with a 'content' field.
+    Cleans each message by removing any content between <think> and </think> tags.
+    If the remaining content is non-empty, the message is kept.
     """
     filtered = []
-    inside_think = False
     for msg in messages:
         content = msg.get("content", "")
-        # If both markers appear in the same message, skip it.
-        if "<think>" in content and "</think>" in content:
-            continue
-        if "<think>" in content:
-            inside_think = True
-            continue
-        if "</think>" in content:
-            inside_think = False
-            continue
-        if not inside_think:
-            filtered.append(msg)
+        # Remove text between <think> and </think> (non-greedy to handle multiple occurrences)
+        cleaned_content = re.sub(r"<think>.*?</think>", "", content, flags=re.DOTALL).strip()
+        if cleaned_content:
+            new_msg = msg.copy()
+            new_msg["content"] = cleaned_content
+            filtered.append(new_msg)
     return filtered
 
 # ---------------------------
@@ -437,7 +431,7 @@ async def generate_response(request: Request, background_tasks: BackgroundTasks)
             if research_results:
                 modified_prompt += f"\n*Internal prompt* Additional Research Data: {research_results}"
 
-        # Retrieve recent chat history and filter out messages between <think> tags.
+        # Retrieve recent chat history and filter out internal chain-of-thought content.
         chat_entry = await chats_collection.find_one({"user_id": user_id, "session_id": session_id})
         if chat_entry and "messages" in chat_entry:
             filtered_messages = filter_think_messages(chat_entry["messages"])
