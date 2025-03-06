@@ -83,6 +83,28 @@ def get_current_datetime() -> str:
     now = datetime.datetime.now()
     return now.strftime("%B %d, %Y, %I:%M %p")
 
+def filter_think_messages(messages: list) -> list:
+    """
+    Filters out any messages that occur between a <think> and </think> marker.
+    Assumes each message is a dict with a 'content' field.
+    """
+    filtered = []
+    inside_think = False
+    for msg in messages:
+        content = msg.get("content", "")
+        # If both markers appear in the same message, skip it.
+        if "<think>" in content and "</think>" in content:
+            continue
+        if "<think>" in content:
+            inside_think = True
+            continue
+        if "</think>" in content:
+            inside_think = False
+            continue
+        if not inside_think:
+            filtered.append(msg)
+    return filtered
+
 # ---------------------------
 # Pydantic MODELS
 # ---------------------------
@@ -415,15 +437,13 @@ async def generate_response(request: Request, background_tasks: BackgroundTasks)
             if research_results:
                 modified_prompt += f"\n*Internal prompt* Additional Research Data: {research_results}"
 
-        # Retrieve recent chat history and use only the latest user query
+        # Retrieve recent chat history and filter out messages between <think> tags.
         chat_entry = await chats_collection.find_one({"user_id": user_id, "session_id": session_id})
         if chat_entry and "messages" in chat_entry:
-            filtered_messages = [msg for msg in chat_entry["messages"] if "<think>" not in msg and "</think>" not in msg]
+            filtered_messages = filter_think_messages(chat_entry["messages"])
             chat_history = filtered_messages[-2:]
         else:
             chat_history = []
-
-
 
         long_term_memory = ""
         mem_entry = await memory_collection.find_one({"user_id": user_id})
@@ -490,8 +510,9 @@ async def generate_response(request: Request, background_tasks: BackgroundTasks)
 async def get_chat_history(user_id: str = Query(...), session_id: str = Query(...)):
     try:
         chat_entry = await chats_collection.find_one({"user_id": user_id, "session_id": session_id}, {"messages": 1})
-        if chat_entry:
-            return {"messages": chat_entry["messages"]}
+        if chat_entry and "messages" in chat_entry:
+            filtered_messages = filter_think_messages(chat_entry["messages"])
+            return {"messages": filtered_messages}
         else:
             return {"messages": []}
     except Exception as e:
