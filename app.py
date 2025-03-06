@@ -417,7 +417,12 @@ async def generate_response(request: Request, background_tasks: BackgroundTasks)
 
         # Retrieve recent chat history and use only the latest user query
         chat_entry = await chats_collection.find_one({"user_id": user_id, "session_id": session_id})
-        chat_history = chat_entry["messages"][-2:] if chat_entry and "messages" in chat_entry else []
+        if chat_entry and "messages" in chat_entry:
+            filtered_messages = [msg for msg in chat_entry["messages"] if "<think>" not in msg and "</think>" not in msg]
+            chat_history = filtered_messages[-2:]
+        else:
+            chat_history = []
+
 
 
         long_term_memory = ""
