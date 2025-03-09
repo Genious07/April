@@ -17,18 +17,27 @@ from bs4 import BeautifulSoup
 from youtube_transcript_api import YouTubeTranscriptApi
 from urllib.parse import unquote, urlparse, parse_qs
 from groq import Groq
+from playwright.async_api import async_playwright
 
-# Set up basic logging with a clear format
+# ---------------------------
+# SET UP LOGGING & ENVIRONMENT
+# ---------------------------
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
-
-# Load environment variables
 load_dotenv()
 
-# Initialize FastAPI app with CORS middleware
+# ---------------------------
+# OPTIONAL IN-MEMORY CACHES
+# ---------------------------
+youtube_transcript_cache = {}  # Cache transcripts by video ID
+web_content_cache = {}         # Cache web content by URL
+
+# ---------------------------
+# FASTAPI APP INITIALIZATION
+# ---------------------------
 app = FastAPI()
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # Adjust origins for production as needed
+    allow_origins=["*"],  # Adjust for production as needed
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -84,14 +93,9 @@ def get_current_datetime() -> str:
     return now.strftime("%B %d, %Y, %I:%M %p")
 
 def filter_think_messages(messages: list) -> list:
-    """
-    Cleans each message by removing any content between <think> and </think> tags.
-    If the remaining content is non-empty, the message is kept.
-    """
     filtered = []
     for msg in messages:
         content = msg.get("content", "")
-        # Remove text between <think> and </think> (non-greedy to handle multiple occurrences)
         cleaned_content = re.sub(r"<think>.*?</think>", "", content, flags=re.DOTALL).strip()
         if cleaned_content:
             new_msg = msg.copy()
@@ -125,34 +129,77 @@ async def async_get(url: str, timeout: int = 20) -> httpx.Response:
     return response
 
 # ---------------------------
-# WEB EXTRACTION FUNCTIONS (ASYNC)
+# HEADLESS BROWSER EXTRACTION USING PLAYWRIGHT
+# ---------------------------
+async def extract_dynamic_content(url: str) -> str:
+    """Fetch rendered HTML using Playwright."""
+    try:
+        async with async_playwright() as p:
+            browser = await p.chromium.launch(headless=True)
+            page = await browser.new_page()
+            await page.goto(url, wait_until='networkidle')
+            # Reduced extra wait time to 0.5 seconds for efficiency
+            await asyncio.sleep(0.5)
+            content = await page.content()
+            await browser.close()
+            logging.info(f"Dynamic content extracted from {url}")
+            return content
+    except Exception as e:
+        logging.error(f"Error in extract_dynamic_content for {url}: {e}", exc_info=True)
+        return f"Error extracting dynamic content from {url}."
+
+# ---------------------------
+# WEB EXTRACTION FUNCTIONS
 # ---------------------------
 async def extract_web_content_async(url: str) -> str:
-    try:
+    """
+    Extract web content using a headless browser first; fall back to static GET.
+    Implements in-memory caching to speed up repeated requests.
+    """
+    if url in web_content_cache:
+        logging.info(f"Using cached content for {url}")
+        return web_content_cache[url]
+
+    # Try dynamic extraction using Playwright.
+    html = await extract_dynamic_content(url)
+    if "Error extracting dynamic content" not in html:
+        soup = BeautifulSoup(html, 'html.parser')
+    else:
         response = await async_get(url, timeout=20)
-        if response.status_code == 200:
-            soup = BeautifulSoup(response.text, 'html.parser')
-            for script in soup(["script", "style"]):
-                script.extract()
-            lines = [line.strip() for line in soup.get_text(separator="\n").splitlines() if line.strip()]
-            content = "\n".join(lines)
-            logging.info(f"Extracted content from {url}: {content[:200]}...")
-            return content
-        else:
-            error_msg = f"Error: Unable to fetch webpage. Status code: {response.status_code}"
-            logging.error(error_msg)
-            return error_msg
-    except Exception as e:
-        logging.error(f"Error in extract_web_content_async: {e}", exc_info=True)
-        return "Error: Exception occurred while extracting webpage content."
+        soup = BeautifulSoup(response.text, 'html.parser')
+    for script in soup(["script", "style"]):
+        script.extract()
+    lines = [line.strip() for line in soup.get_text(separator="\n").splitlines() if line.strip()]
+    content = "\n".join(lines)
+    web_content_cache[url] = content
+    logging.info(f"Extracted {len(content)} characters from {url}")
+    return content
+
+def extract_actual_url(duckduckgo_url: str) -> str:
+    if duckduckgo_url.startswith("/l/?"):
+        parsed_url = urlparse(duckduckgo_url)
+        return unquote(parse_qs(parsed_url.query).get("uddg", [""])[0])
+    return duckduckgo_url
+
+# ---------------------------
+# YOUTUBE TRANSCRIPT EXTRACTION FUNCTIONS
+# ---------------------------
+def extract_youtube_video_id(url: str) -> str:
+    match = re.search(r"(?:v=|youtu\.be/)([A-Za-z0-9_-]{11})", url)
+    return match.group(1) if match else None
 
 def _extract_youtube_info(url: str) -> str:
     try:
         video_id = extract_youtube_video_id(url)
         if not video_id:
             return "Could not extract video ID from URL."
+        # Use cached transcript if available
+        if video_id in youtube_transcript_cache:
+            logging.info(f"Using cached transcript for video {video_id}")
+            return youtube_transcript_cache[video_id]
         transcript_list = YouTubeTranscriptApi.get_transcript(video_id)
         transcript = " ".join([d["text"] for d in transcript_list])
+        youtube_transcript_cache[video_id] = transcript
         logging.info(f"Extracted YouTube transcript for video {video_id}: {transcript[:200]}...")
         return transcript
     except Exception as e:
@@ -162,18 +209,8 @@ def _extract_youtube_info(url: str) -> str:
 async def extract_youtube_info_async(url: str) -> str:
     return await asyncio.to_thread(_extract_youtube_info, url)
 
-def extract_youtube_video_id(url: str) -> str:
-    match = re.search(r"(?:v=|youtu\.be/)([A-Za-z0-9_-]{11})", url)
-    return match.group(1) if match else None
-
-def extract_actual_url(duckduckgo_url: str) -> str:
-    if duckduckgo_url.startswith("/l/?"):
-        parsed_url = urlparse(duckduckgo_url)
-        return unquote(parse_qs(parsed_url.query).get("uddg", [""])[0])
-    return duckduckgo_url
-
 # ---------------------------
-# GROQ CALL FUNCTIONS (REPLACING OPENAI CALLS)
+# GROQ CALL FUNCTIONS
 # ---------------------------
 async def content_for_website(content: str) -> str:
     prompt = (
@@ -245,7 +282,11 @@ async def classify_prompt(prompt: str) -> str:
 
 async def free_search(query: str, limit: int = 10) -> str:
     try:
-        headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/90.0.4430.85 Safari/537.36"}
+        headers = {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                          "AppleWebKit/537.36 (KHTML, like Gecko) "
+                          "Chrome/90.0.4430.85 Safari/537.36"
+        }
         url = "https://html.duckduckgo.com/html"
         data = {"q": query}
         async with httpx.AsyncClient(follow_redirects=True) as client:
@@ -255,14 +296,23 @@ async def free_search(query: str, limit: int = 10) -> str:
         await asyncio.sleep(0.2)
         soup = BeautifulSoup(response.text, "html.parser")
         results = []
+        # Use more robust extraction with multiple selectors
         for result in soup.find_all("div", class_="result")[:limit]:
             link_tag = result.find("a", class_="result__a")
             if not link_tag:
                 continue
             title = link_tag.get_text()
             link = extract_actual_url(link_tag.get("href"))
-            snippet_tag = result.find("div", class_="result__snippet")
-            snippet = snippet_tag.get_text() if snippet_tag else "No snippet available."
+            snippet = ""
+            snippet_tag = result.find("a", class_="result__snippet")
+            if snippet_tag:
+                snippet = snippet_tag.get_text()
+            else:
+                snippet_div = result.find("div", class_="result__snippet")
+                if snippet_div:
+                    snippet = snippet_div.get_text()
+            if not snippet:
+                snippet = result.get_text(strip=True)[:200]
             results.append(f"Title: {title}\nLink: {link}\nSnippet: {snippet}\n")
         final_results = "\n".join(results) if results else "No relevant search results found."
         logging.info(f"Free search extracted content: {final_results[:200]}...")
@@ -288,7 +338,6 @@ async def browse_and_generate(user_query: str) -> str:
             raw_content = await free_search(user_query)
         
         logging.info(f"Raw content extracted: {raw_content[:300]}...")
-        
         llm_prompt = (
             f"User Query: {query_with_date}\n\n"
             f"Extracted Content:\n{raw_content}\n\n"
@@ -316,7 +365,34 @@ async def browse_and_generate(user_query: str) -> str:
         return "Error processing browse and generate request."
 
 # ---------------------------
-# UPDATED LONG-TERM SUMMARY MAKER
+# NEW HELPER FUNCTIONS FOR RAG CRAWLING
+# ---------------------------
+def extract_urls_from_search_results(search_results: str) -> list:
+    pattern = r"Link:\s*(https?://\S+)"
+    return re.findall(pattern, search_results)
+
+async def crawl_and_extract(query: str, max_pages: int = 5) -> str:
+    modified_query = query  # Use the query as is
+    search_results = await free_search(modified_query)
+    urls = extract_urls_from_search_results(search_results)
+    urls = urls[:max_pages]
+    if not urls:
+        return "No URLs found for crawling."
+    
+    for url in urls:
+        logging.info(f"URL to be crawled: {url}")
+    
+    tasks = [asyncio.create_task(extract_web_content_async(url)) for url in urls]
+    pages_contents = await asyncio.gather(*tasks, return_exceptions=True)
+    aggregated = "\n\n".join([content for content in pages_contents if isinstance(content, str)])
+    
+    if len(aggregated) > 4000:
+        aggregated = await content_for_website(aggregated)
+    
+    return aggregated
+
+# ---------------------------
+# LONG-TERM SUMMARY FUNCTIONS
 # ---------------------------
 async def efficient_summarize(previous_summary: str, new_messages: list, user_id: str, max_summary_length: int = 500) -> str:
     user_queries = "\n".join([msg["content"] for msg in new_messages if msg["role"] == "user"])
@@ -431,7 +507,6 @@ async def generate_response(request: Request, background_tasks: BackgroundTasks)
             if research_results:
                 modified_prompt += f"\n*Internal prompt* Additional Research Data: {research_results}"
 
-        # Retrieve recent chat history and filter out internal chain-of-thought content.
         chat_entry = await chats_collection.find_one({"user_id": user_id, "session_id": session_id})
         if chat_entry and "messages" in chat_entry:
             filtered_messages = filter_think_messages(chat_entry["messages"])
@@ -534,7 +609,6 @@ async def browse_internet(request: Request):
             raw_content = await free_search(query)
         
         logging.info(f"Browsing raw content: {raw_content[:300]}...")
-        
         llm_prompt = (
             f"User Query: {query}\n\n"
             f"Extracted Content:\n{raw_content}\n\n"
@@ -561,9 +635,50 @@ async def browse_internet(request: Request):
         logging.error(f"Error in browse_internet endpoint: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail="An internal error occurred during browsing.")
 
+@app.post("/crawl", response_model=BrowseResponse)
+async def crawl_and_generate_endpoint(request: Request):
+    """
+    Integrates the RAG pipeline with a real-time web crawler.
+    It accepts a user query, performs a web crawl to fetch and aggregate multiple pages,
+    and then uses the aggregated content to generate a context-rich answer.
+    """
+    try:
+        current_date = get_current_datetime()
+        data = await request.json()
+        req = BrowseRequest(**data)
+        query = req.query.strip()
+        
+        aggregated_content = await crawl_and_extract(query, max_pages=5)
+        logging.info(f"Crawled and aggregated content: {aggregated_content[:300]}...")
+        
+        llm_prompt = (
+            f"User Query: {query}\n"
+            f"Current Date/Time: {current_date}\n\n"
+            f"Aggregated Web Content:\n{aggregated_content}\n\n"
+            "Based on the above, provide a detailed and insightful answer that integrates the real-time information from multiple sources."
+        )
+        
+        client_crawl = Groq(api_key=os.environ.get("GROQ_API_KEY_CRAWL"))
+        llm_response = await asyncio.to_thread(
+            client_crawl.chat.completions.create,
+            messages=[
+                {"role": "system", "content": "You are a RAG system that uses crawled web content to provide up-to-date answers."},
+                {"role": "user", "content": llm_prompt}
+            ],
+            model="llama3-70b-8192",
+            max_tokens=1500,
+            temperature=0.7,
+        )
+        final_output = llm_response.choices[0].message.content.strip()
+        logging.info(f"Final output from /crawl endpoint: {final_output[:300]}...")
+        return BrowseResponse(result=final_output)
+    except Exception as e:
+        logging.error(f"Error in crawl_and_generate_endpoint: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail="An error occurred during the crawling process.")
+
 # ---------------------------
 # RUN THE APPLICATION
 # ---------------------------
 if __name__ == '__main__':
     import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=8000, reload=True)
+    uvicorn.run(app, host="0.0.0.0", port=int(os.getenv("PORT", 8000)), reload=False)
