@@ -66,3 +66,21 @@ uvicorn==0.34.0
 yarl==1.18.3
 youtube-transcript-api==0.6.3
 zstandard==0.23.0
+fastapi
+uvicorn
+python-dotenv
+motor
+httpx
+beautifulsoup4
+youtube-transcript-api
+PyMuPDF           # for 'fitz'
+docx2txt
+Pillow            # for 'PIL'
+easyocr
+torch
+transformers
+faiss-cpu         # or 'faiss-gpu' if you plan to use a GPU version
+numpy
+groq
+
+
