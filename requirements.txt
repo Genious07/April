@@ -80,6 +80,7 @@ easyocr
 torch
 transformers
 faiss-cpu         # or 'faiss-gpu' if you plan to use a GPU version
+python-multipart
 numpy
 groq
 
