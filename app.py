@@ -21,45 +21,32 @@ import docx2txt                 # For DOCX extraction
 from PIL import Image           # For image processing
 import easyocr                  # For OCR on images
 from io import BytesIO
-
-# NEW: BLIP model for image captioning fallback
 import torch
 from transformers import BlipProcessor, BlipForConditionalGeneration
-
-# Groq API for LLM integration
 from groq import Groq
 
 os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"
 
-# -------------------------------------------------
 # Logging & Environment Setup
-# -------------------------------------------------
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 load_dotenv()
 
-# -------------------------------------------------
 # FastAPI and CORS Initialization
-# -------------------------------------------------
 app = FastAPI()
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # In production, replace with allowed origins
+    allow_origins=["*"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-# -------------------------------------------------
-# Global Error Handler
-# -------------------------------------------------
 @app.exception_handler(Exception)
 async def global_exception_handler(request: Request, exc: Exception):
     logging.error(f"Unhandled error: {exc}", exc_info=True)
     return JSONResponse(status_code=500, content={"detail": "Internal server error, please try again later."})
 
-# -------------------------------------------------
 # Database & FAISS Setup
-# -------------------------------------------------
 def get_database():
     client = AsyncIOMotorClient(os.getenv("MONGO_URI"))
     return client["stelle_db"]
@@ -69,12 +56,10 @@ chats_collection = db["chats"]
 memory_collection = db["long_term_memory"]
 uploads_collection = db["uploads"]
 
-# FAISS indices for long-term memory and uploaded files
 llm_index = faiss.IndexFlatL2(1536)
-llm_memory_map = {}  # Maps user_id to FAISS index ID for long-term memory
-
+llm_memory_map = {}
 upload_index = faiss.IndexFlatL2(1536)
-upload_memory_map = {}  # Maps file_id to metadata (user_id, filename, modality, snippet, usage_count)
+upload_memory_map = {}  # Maps FAISS index ID to MongoDB document ID
 
 async def load_faiss_indices():
     try:
@@ -90,9 +75,7 @@ async def load_faiss_indices():
 async def startup_event():
     await load_faiss_indices()
 
-# -------------------------------------------------
 # Utility Functions
-# -------------------------------------------------
 def get_current_datetime() -> str:
     return datetime.datetime.now().strftime("%B %d, %Y, %I:%M %p")
 
@@ -107,9 +90,20 @@ def filter_think_messages(messages: list) -> list:
             filtered.append(new_msg)
     return filtered
 
-# -------------------------------------------------
+def split_text(text, chunk_size=500, overlap=100):
+    """Split text into chunks for embedding and retrieval."""
+    if len(text) <= chunk_size:
+        return [text]
+    chunks = []
+    start = 0
+    while start < len(text):
+        end = start + chunk_size
+        chunk = text[start:end]
+        chunks.append(chunk)
+        start = end - overlap
+    return chunks
+
 # Pydantic Models
-# -------------------------------------------------
 class GenerateRequest(BaseModel):
     user_id: str
     session_id: str
@@ -124,9 +118,7 @@ class BrowseRequest(BaseModel):
 class BrowseResponse(BaseModel):
     result: str
 
-# -------------------------------------------------
-# Web Content & YouTube Extraction
-# -------------------------------------------------
+# Web Content & YouTube Extraction (unchanged)
 async def async_get(url: str, timeout: int = 20) -> httpx.Response:
     async with httpx.AsyncClient(follow_redirects=True) as client:
         return await client.get(url, timeout=timeout)
@@ -175,9 +167,7 @@ def _extract_youtube_info(url: str) -> str:
 async def extract_youtube_info_async(url: str) -> str:
     return await asyncio.to_thread(_extract_youtube_info, url)
 
-# -------------------------------------------------
 # Document Extraction Functions
-# -------------------------------------------------
 async def extract_text_from_pdf(file: UploadFile) -> str:
     try:
         file.file.seek(0)
@@ -212,10 +202,7 @@ async def extract_text_from_txt(file: UploadFile) -> str:
         logging.error(f"TXT extraction error: {e}", exc_info=True)
         return ""
 
-# -------------------------------------------------
 # Image Extraction: OCR & Captioning
-# -------------------------------------------------
-# Initialize BLIP for captioning (loaded once at startup)
 BLIP_MODEL_ID = "Salesforce/blip-image-captioning-base"
 try:
     blip_processor = BlipProcessor.from_pretrained(BLIP_MODEL_ID)
@@ -259,9 +246,7 @@ async def extract_text_from_image(file: UploadFile) -> str:
         logging.error(f"Error extracting text from image: {e}", exc_info=True)
         return ""
 
-# -------------------------------------------------
 # Embedding Generation
-# -------------------------------------------------
 async def generate_text_embedding(text: str) -> list:
     try:
         import openai
@@ -272,9 +257,7 @@ async def generate_text_embedding(text: str) -> list:
         logging.error(f"Embedding generation error: {e}", exc_info=True)
         return []
 
-# -------------------------------------------------
-# Groq API Integration Functions
-# -------------------------------------------------
+# Groq API Integration Functions (unchanged)
 async def content_for_website(content: str) -> str:
     prompt = (
         f"Summarize the following content concisely:\n\n{content}\n\n"
@@ -398,12 +381,9 @@ async def browse_and_generate(user_query: str) -> str:
         logging.error(f"Browse and generate error: {e}", exc_info=True)
         return "Error processing browse and generate request."
 
-# -------------------------------------------------
 # Multi-Modal Retrieval Integration
-# -------------------------------------------------
-async def retrieve_multimodal_context(query: str) -> str:
-    """Generate query embedding and return combined text snippets from uploaded files.
-       Each file context is only used for up to 3 chats and then dropped."""
+async def retrieve_multimodal_context(query: str, user_id: str) -> str:
+    """Retrieve relevant chunks from user's uploaded files based on query embedding."""
     try:
         embedding = await generate_text_embedding(query)
         if not embedding or upload_index.ntotal == 0:
@@ -412,23 +392,31 @@ async def retrieve_multimodal_context(query: str) -> str:
         k = 3  # Top 3 matches
         distances, indices = upload_index.search(query_vector, k)
         contexts = []
+        to_remove = []
         for idx in indices[0]:
             if idx in upload_memory_map:
-                meta = upload_memory_map[idx]
-                usage_count = meta.get("usage_count", 0)
-                if usage_count < 3:
-                    meta["usage_count"] = usage_count + 1
-                    contexts.append(f"Filename: {meta['filename']}\nModality: {meta['modality']}\nSnippet: {meta['text_snippet']}")
-                if meta.get("usage_count", 0) >= 3:
-                    del upload_memory_map[idx]
+                doc_id = upload_memory_map[idx]
+                chunk_doc = await uploads_collection.find_one({"_id": doc_id, "user_id": user_id})
+                if chunk_doc and chunk_doc.get("usage_count", 0) < 3:
+                    contexts.append(
+                        f"From uploaded {chunk_doc['modality']} '{chunk_doc['filename']}': {chunk_doc['chunk_text']}"
+                    )
+                    new_usage_count = chunk_doc["usage_count"] + 1
+                    await uploads_collection.update_one(
+                        {"_id": doc_id},
+                        {"$set": {"usage_count": new_usage_count}}
+                    )
+                    if new_usage_count >= 3:
+                        to_remove.append(idx)
+        for idx in to_remove:
+            upload_index.remove_ids(np.array([idx], dtype="int64"))
+            del upload_memory_map[idx]
         return "\n\n".join(contexts)
     except Exception as e:
         logging.error(f"Error during multimodal retrieval: {e}", exc_info=True)
         return ""
 
-# -------------------------------------------------
-# Long-Term Memory Functions
-# -------------------------------------------------
+# Long-Term Memory Functions (unchanged)
 async def efficient_summarize(previous_summary: str, new_messages: list, user_id: str, max_summary_length: int = 500) -> str:
     user_queries = "\n".join([msg["content"] for msg in new_messages if msg["role"] == "user"])
     context_text = f"User ID: {user_id}\n"
@@ -475,7 +463,6 @@ async def store_long_term_memory(user_id: str, session_id: str, new_messages: li
                     "timestamp": datetime.datetime.now(datetime.timezone.utc)
                 }}
             )
-            # Update FAISS index: remove old and add new vector
             new_vector = np.array(new_vector, dtype="float32").reshape(1, -1)
             llm_index.remove_ids(np.array([llm_memory_map[user_id]], dtype="int64")) if user_id in llm_memory_map else None
             idx = llm_index.ntotal
@@ -497,22 +484,19 @@ async def store_long_term_memory(user_id: str, session_id: str, new_messages: li
     except Exception as e:
         logging.error(f"Error storing long-term memory: {e}", exc_info=True)
 
-# -------------------------------------------------
 # Endpoints
-# -------------------------------------------------
 @app.post("/upload")
 async def upload_file(user_id: str = Form(...), files: list[UploadFile] = File(...)):
     """
-    Handle multi-modal file uploads:
-      - For PDFs, DOCX, and TXT: extract text.
-      - For images: perform OCR and fallback captioning.
-      - Generate an embedding for the extracted text, store in FAISS and MongoDB.
-      - Returns a success flag (true if processed successfully, false otherwise) per file.
+    Handle multi-modal file uploads by splitting text into chunks and storing each chunk.
+    - Text files (PDF, DOCX, TXT): Extract text and split into 500-char chunks with 100-char overlap.
+    - Images: Extract text (OCR or caption) and treat as one chunk.
+    - Store embeddings in FAISS and full chunk data in MongoDB.
     """
     allowed_text_types = [
-        "text/plain", 
-        "application/pdf", 
-        "application/msword", 
+        "text/plain",
+        "application/pdf",
+        "application/msword",
         "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
     ]
     allowed_image_types = ["image/jpeg", "image/png", "image/jpg"]
@@ -525,6 +509,7 @@ async def upload_file(user_id: str = Form(...), files: list[UploadFile] = File(.
                 continue
 
             extracted_text = ""
+            modality = "document" if file.content_type in allowed_text_types else "image"
             if file.content_type == "application/pdf":
                 extracted_text = await extract_text_from_pdf(file)
             elif file.content_type in ["application/msword", "application/vnd.openxmlformats-officedocument.wordprocessingml.document"]:
@@ -541,35 +526,30 @@ async def upload_file(user_id: str = Form(...), files: list[UploadFile] = File(.
                 responses.append({"filename": file.filename, "success": False})
                 continue
 
-            embedding_vector = await generate_text_embedding(extracted_text)
-            if not embedding_vector:
-                responses.append({"filename": file.filename, "success": False})
-                continue
-
-            new_vector = np.array(embedding_vector, dtype="float32").reshape(1, -1)
-            new_id = upload_index.ntotal
-            upload_index.add(new_vector)
-            modality = "document" if file.content_type in allowed_text_types else "image"
-            # Initialize usage_count to 0
-            upload_memory_map[new_id] = {
-                "user_id": user_id,
-                "filename": file.filename,
-                "modality": modality,
-                "text_snippet": extracted_text[:200],
-                "usage_count": 0
-            }
-
-            await uploads_collection.insert_one({
-                "user_id": user_id,
-                "filename": file.filename,
-                "modality": modality,
-                "text_snippet": extracted_text[:500],
-                "embedding": embedding_vector,
-                "timestamp": datetime.datetime.now(datetime.timezone.utc)
-            })
+            # Split text into chunks (images typically yield one chunk)
+            chunks = split_text(extracted_text)
+            for chunk in chunks:
+                embedding_vector = await generate_text_embedding(chunk)
+                if not embedding_vector:
+                    continue
+                doc = {
+                    "user_id": user_id,
+                    "filename": file.filename,
+                    "modality": modality,
+                    "chunk_text": chunk,
+                    "embedding": embedding_vector,
+                    "usage_count": 0,
+                    "timestamp": datetime.datetime.now(datetime.timezone.utc)
+                }
+                result = await uploads_collection.insert_one(doc)
+                doc_id = result.inserted_id
+                new_vector = np.array(embedding_vector, dtype="float32").reshape(1, -1)
+                new_id = upload_index.ntotal
+                upload_index.add(new_vector)
+                upload_memory_map[new_id] = doc_id
 
             responses.append({"filename": file.filename, "success": True})
-            logging.info(f"File '{file.filename}' uploaded for user {user_id}")
+            logging.info(f"File '{file.filename}' uploaded and chunked for user {user_id}")
         except Exception as e:
             logging.error(f"Error processing file '{file.filename}': {e}", exc_info=True)
             responses.append({"filename": file.filename, "success": False})
@@ -578,11 +558,9 @@ async def upload_file(user_id: str = Form(...), files: list[UploadFile] = File(.
 @app.post("/generate", response_model=GenerateResponse)
 async def generate_response(request: Request, background_tasks: BackgroundTasks):
     """
-    Generate a response for the given prompt.
-      - Extract external content if URLs are provided.
-      - Retrieve multi-modal contexts from uploaded files.
-      - Merge all retrieved information into a single unified prompt.
-      - Call the LLM (via Groq) and update chat history and long-term memory.
+    Generate a response with enhanced multi-modal context retrieval.
+    - Retrieve user-specific chunks from uploaded files.
+    - Include full chunk texts in the prompt for detailed responses.
     """
     try:
         current_date = get_current_datetime()
@@ -606,15 +584,15 @@ async def generate_response(request: Request, background_tasks: BackgroundTasks)
                 external_content = await extract_web_content_async(url)
                 external_content = await content_for_website(external_content)
 
-        # Retrieve multi-modal context from uploaded files
-        multimodal_context = await retrieve_multimodal_context(user_message)
+        # Retrieve multi-modal context from user's uploaded files
+        multimodal_context = await retrieve_multimodal_context(user_message, user_id)
 
         # Construct unified prompt for the LLM
         unified_prompt = f"User Query: {user_message}\n"
         if external_content:
             unified_prompt += f"\n[External Content]:\n{external_content}\n"
         if multimodal_context:
-            unified_prompt += f"\n[Retrieved File Context]:\n{multimodal_context}\n"
+            unified_prompt += f"\n[Retrieved File Contexts]:\n{multimodal_context}\n"
         unified_prompt += f"\nCurrent Date/Time: {current_date}\n\nProvide a detailed and context-aware response."
 
         # Optionally determine if additional research is needed
@@ -642,7 +620,7 @@ async def generate_response(request: Request, background_tasks: BackgroundTasks)
         messages.append({"role": "user", "content": unified_prompt})
         logging.info(f"LLM prompt messages: {messages}")
 
-        # Call the LLM via Groq API using one of the provided keys
+        # Call the LLM via Groq API
         generate_api_keys = [os.getenv("GROQ_API_KEY_GENERATE_1"), os.getenv("GROQ_API_KEY_GENERATE_2")]
         selected_key = random.choice(generate_api_keys)
         client_generate = Groq(api_key=selected_key)
@@ -730,9 +708,6 @@ async def browse_internet(request: Request):
         logging.error(f"Browse endpoint error: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail="Internal error during browsing.")
 
-# -------------------------------------------------
-# Run the Application
-# -------------------------------------------------
 if __name__ == '__main__':
     import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=8000, reload=True)
