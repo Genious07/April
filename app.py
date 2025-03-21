@@ -64,6 +64,9 @@ upload_memory_map = {}  # Maps FAISS index ID to MongoDB document ID
 async def load_faiss_indices():
     try:
         async for mem in memory_collection.find():
+            if "vector" not in mem:
+                logging.error(f"Memory document for user {mem.get('user_id', 'unknown')} is missing the 'vector' field; skipping.")
+                continue
             vector = np.array(mem["vector"], dtype="float32").reshape(1, -1)
             idx = llm_index.ntotal
             llm_index.add(vector)
