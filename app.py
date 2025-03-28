@@ -21,32 +21,52 @@ import docx2txt                 # For DOCX extraction
 from PIL import Image           # For image processing
 import easyocr                  # For OCR on images
 from io import BytesIO
+import uuid                     # For unique goal/task IDs
+
+# NEW: BLIP model for image captioning fallback
 import torch
 from transformers import BlipProcessor, BlipForConditionalGeneration
+
+# Groq API for LLM integration (replace with your actual library/client if needed)
 from groq import Groq
+from duckduckgo_search import DDGS
+import trafilatura
+from concurrent.futures import ThreadPoolExecutor
+
+# Initialize ThreadPoolExecutor (add at module level)
+executor = ThreadPoolExecutor(max_workers=20)
 
 os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"
 
+# -------------------------------------------------
 # Logging & Environment Setup
+# -------------------------------------------------
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 load_dotenv()
 
+# -------------------------------------------------
 # FastAPI and CORS Initialization
+# -------------------------------------------------
 app = FastAPI()
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=["*"],  # In production, replace with specific allowed origins
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
+# -------------------------------------------------
+# Global Error Handler
+# -------------------------------------------------
 @app.exception_handler(Exception)
 async def global_exception_handler(request: Request, exc: Exception):
     logging.error(f"Unhandled error: {exc}", exc_info=True)
     return JSONResponse(status_code=500, content={"detail": "Internal server error, please try again later."})
 
+# -------------------------------------------------
 # Database & FAISS Setup
+# -------------------------------------------------
 def get_database():
     client = AsyncIOMotorClient(os.getenv("MONGO_URI"))
     return client["stelle_db"]
@@ -55,18 +75,18 @@ db = get_database()
 chats_collection = db["chats"]
 memory_collection = db["long_term_memory"]
 uploads_collection = db["uploads"]
+goals_collection = db["goals"]  # Collection for goals and tasks
 
+# FAISS indices for long-term memory and uploaded files
 llm_index = faiss.IndexFlatL2(1536)
-llm_memory_map = {}
+llm_memory_map = {}  # Maps user_id to FAISS index ID for long-term memory
+
 upload_index = faiss.IndexFlatL2(1536)
-upload_memory_map = {}  # Maps FAISS index ID to MongoDB document ID
+upload_memory_map = {}  # Maps file_id (FAISS index) to metadata (user_id, filename, modality, snippet, usage_count)
 
 async def load_faiss_indices():
     try:
         async for mem in memory_collection.find():
-            if "vector" not in mem:
-                logging.error(f"Memory document for user {mem.get('user_id', 'unknown')} is missing the 'vector' field; skipping.")
-                continue
             vector = np.array(mem["vector"], dtype="float32").reshape(1, -1)
             idx = llm_index.ntotal
             llm_index.add(vector)
@@ -78,11 +98,16 @@ async def load_faiss_indices():
 async def startup_event():
     await load_faiss_indices()
 
+# -------------------------------------------------
 # Utility Functions
+# -------------------------------------------------
 def get_current_datetime() -> str:
     return datetime.datetime.now().strftime("%B %d, %Y, %I:%M %p")
 
 def filter_think_messages(messages: list) -> list:
+    """
+    Removes <think> ... </think> content from message strings.
+    """
     filtered = []
     for msg in messages:
         content = msg.get("content", "")
@@ -93,20 +118,22 @@ def filter_think_messages(messages: list) -> list:
             filtered.append(new_msg)
     return filtered
 
-def split_text(text, chunk_size=500, overlap=100):
-    """Split text into chunks for embedding and retrieval."""
-    if len(text) <= chunk_size:
-        return [text]
-    chunks = []
-    start = 0
-    while start < len(text):
-        end = start + chunk_size
-        chunk = text[start:end]
-        chunks.append(chunk)
-        start = end - overlap
-    return chunks
+def convert_object_ids(document: dict) -> dict:
+    """
+    Recursively convert ObjectId values to strings for JSON serialization.
+    """
+    for key, value in document.items():
+        if key == "_id":
+            document[key] = str(value)
+        elif isinstance(value, dict):
+            document[key] = convert_object_ids(value)
+        elif isinstance(value, list):
+            document[key] = [convert_object_ids(item) if isinstance(item, dict) else item for item in value]
+    return document
 
+# -------------------------------------------------
 # Pydantic Models
+# -------------------------------------------------
 class GenerateRequest(BaseModel):
     user_id: str
     session_id: str
@@ -121,28 +148,50 @@ class BrowseRequest(BaseModel):
 class BrowseResponse(BaseModel):
     result: str
 
-# Web Content & YouTube Extraction (unchanged)
+# -------------------------------------------------
+# Web Content & YouTube Extraction
+# -------------------------------------------------
 async def async_get(url: str, timeout: int = 20) -> httpx.Response:
     async with httpx.AsyncClient(follow_redirects=True) as client:
         return await client.get(url, timeout=timeout)
-
-async def extract_web_content_async(url: str) -> str:
+    
+async def scrape_url(url: str) -> str:
+    """
+    Scrape the given URL using Trafilatura for reliable content extraction.
+    Replaces extract_web_content_async to address incorrect outputs.
+    """
     try:
-        response = await async_get(url, timeout=20)
-        if response.status_code == 200:
-            soup = BeautifulSoup(response.text, 'html.parser')
-            for tag in soup(["script", "style"]):
-                tag.extract()
-            lines = [line.strip() for line in soup.get_text(separator="\n").splitlines() if line.strip()]
-            content = "\n".join(lines)
-            logging.info(f"Web content extracted (first 200 chars): {content[:200]}...")
-            return content
-        else:
-            logging.error(f"Error fetching webpage: {response.status_code}")
-            return f"Error: Unable to fetch webpage. Status code: {response.status_code}"
+        async with httpx.AsyncClient(follow_redirects=True) as client:
+            response = await client.get(url, timeout=20)
+            if response.status_code == 200:
+                html = response.text
+                content = trafilatura.extract(html)
+                return content if content else ""
+            else:
+                logging.error(f"Failed to scrape {url}: Status {response.status_code}")
+                return ""
     except Exception as e:
-        logging.error(f"Exception in web extraction: {e}", exc_info=True)
-        return "Error: Exception occurred while extracting webpage content."
+        logging.error(f"scrape_url error for {url}: {e}")
+        return ""
+
+# New search function replacing free_search
+async def search_duckduckgo(query: str, max_results: int = 5) -> list[str]:
+    """
+    Search DuckDuckGo using duckduckgo_search library for accurate results.
+    Replaces free_search to improve search reliability.
+    """
+    loop = asyncio.get_event_loop()
+    def sync_search():
+        with DDGS() as ddgs:
+            return [result['href'] for result in ddgs.text(query, max_results=max_results)]
+    try:
+        urls = await loop.run_in_executor(executor, sync_search)
+        return urls
+    except Exception as e:
+        logging.error(f"search_duckduckgo error for query '{query}': {e}")
+        return []
+
+
 
 def extract_youtube_video_id(url: str) -> str:
     match = re.search(r"(?:v=|youtu\.be/)([A-Za-z0-9_-]{11})", url)
@@ -170,7 +219,9 @@ def _extract_youtube_info(url: str) -> str:
 async def extract_youtube_info_async(url: str) -> str:
     return await asyncio.to_thread(_extract_youtube_info, url)
 
+# -------------------------------------------------
 # Document Extraction Functions
+# -------------------------------------------------
 async def extract_text_from_pdf(file: UploadFile) -> str:
     try:
         file.file.seek(0)
@@ -205,7 +256,9 @@ async def extract_text_from_txt(file: UploadFile) -> str:
         logging.error(f"TXT extraction error: {e}", exc_info=True)
         return ""
 
+# -------------------------------------------------
 # Image Extraction: OCR & Captioning
+# -------------------------------------------------
 BLIP_MODEL_ID = "Salesforce/blip-image-captioning-base"
 try:
     blip_processor = BlipProcessor.from_pretrained(BLIP_MODEL_ID)
@@ -249,10 +302,16 @@ async def extract_text_from_image(file: UploadFile) -> str:
         logging.error(f"Error extracting text from image: {e}", exc_info=True)
         return ""
 
+# -------------------------------------------------
 # Embedding Generation
+# -------------------------------------------------
 async def generate_text_embedding(text: str) -> list:
+    """
+    Uses OpenAI's text-embedding-ada-002 to generate an embedding.
+    """
     try:
         import openai
+        openai.api_key = os.getenv("OPENAI_API_KEY")
         response = await openai.Embedding.acreate(input=text, model="text-embedding-ada-002")
         embedding = response["data"][0]["embedding"]
         return embedding
@@ -260,7 +319,9 @@ async def generate_text_embedding(text: str) -> list:
         logging.error(f"Embedding generation error: {e}", exc_info=True)
         return []
 
-# Groq API Integration Functions (unchanged)
+# -------------------------------------------------
+# Groq API Integration Functions
+# -------------------------------------------------
 async def content_for_website(content: str) -> str:
     prompt = (
         f"Summarize the following content concisely:\n\n{content}\n\n"
@@ -306,6 +367,9 @@ async def detailed_explanation(content: str) -> str:
         return "Error generating detailed explanation."
 
 async def classify_prompt(prompt: str) -> str:
+    """
+    Classifies if the user query needs "research" or "no research".
+    """
     try:
         client = Groq(api_key=os.getenv("GROQ_API_KEY_CLASSIFY"))
         response = await asyncio.to_thread(
@@ -323,44 +387,28 @@ async def classify_prompt(prompt: str) -> str:
         logging.error(f"Classify prompt error: {e}", exc_info=True)
         return "no research"
 
-async def free_search(query: str, limit: int = 10) -> str:
-    try:
-        headers = {"User-Agent": "Mozilla/5.0"}
-        url = "https://html.duckduckgo.com/html"
-        data = {"q": query}
-        async with httpx.AsyncClient(follow_redirects=True) as client:
-            response = await client.post(url, data=data, headers=headers, timeout=20)
-        response.raise_for_status()
-        soup = BeautifulSoup(response.text, "html.parser")
-        results = []
-        for result in soup.find_all("div", class_="result")[:limit]:
-            link_tag = result.find("a", class_="result__a")
-            if not link_tag:
-                continue
-            title = link_tag.get_text()
-            link = extract_actual_url(link_tag.get("href"))
-            snippet_tag = result.find("div", class_="result__snippet")
-            snippet = snippet_tag.get_text() if snippet_tag else "No snippet available."
-            results.append(f"Title: {title}\nLink: {link}\nSnippet: {snippet}\n")
-        final_results = "\n".join(results) if results else "No relevant search results found."
-        logging.info(f"Free search results (first 200 chars): {final_results[:200]}...")
-        return final_results
-    except Exception as e:
-        logging.error(f"Free search error: {e}", exc_info=True)
-        return "Error during search."
 
 async def browse_and_generate(user_query: str) -> str:
+    """
+    Perform web search or extraction, then generate an LLM response.
+    Updated to use the web scraping agent system.
+    """
     current_date = get_current_datetime()
     query_with_date = f"{user_query.strip()} Today’s date/time is: {current_date}"
     logging.info(f"Browse query: {query_with_date}")
     try:
-        if re.search(r'https?://[^\s]+', user_query):
-            if "youtube.com" in user_query or "youtu.be" in user_query:
-                raw_content = await extract_youtube_info_async(user_query)
+        url_match = re.search(r'https?://[^\s]+', user_query)
+        if url_match:
+            url = url_match.group(0)
+            if "youtube.com" in url or "youtu.be" in url:
+                raw_content = await extract_youtube_info_async(url)
             else:
-                raw_content = await extract_web_content_async(user_query)
+                raw_content = await scrape_url(url)
         else:
-            raw_content = await free_search(user_query)
+            urls = await search_duckduckgo(user_query, max_results=5)
+            contents = await asyncio.gather(*[scrape_url(url) for url in urls])
+            raw_content = " ".join([c for c in contents if c])[:4000]
+
         llm_prompt = (
             f"User Query: {query_with_date}\n\n"
             f"Extracted Content:\n{raw_content}\n\n"
@@ -383,10 +431,13 @@ async def browse_and_generate(user_query: str) -> str:
     except Exception as e:
         logging.error(f"Browse and generate error: {e}", exc_info=True)
         return "Error processing browse and generate request."
-
+# -------------------------------------------------
 # Multi-Modal Retrieval Integration
-async def retrieve_multimodal_context(query: str, user_id: str) -> str:
-    """Retrieve relevant chunks from user's uploaded files based on query embedding."""
+# -------------------------------------------------
+async def retrieve_multimodal_context(query: str) -> str:
+    """
+    Generate query embedding and return combined text snippets from top matching uploaded files.
+    """
     try:
         embedding = await generate_text_embedding(query)
         if not embedding or upload_index.ntotal == 0:
@@ -395,39 +446,50 @@ async def retrieve_multimodal_context(query: str, user_id: str) -> str:
         k = 3  # Top 3 matches
         distances, indices = upload_index.search(query_vector, k)
         contexts = []
-        to_remove = []
         for idx in indices[0]:
             if idx in upload_memory_map:
-                doc_id = upload_memory_map[idx]
-                chunk_doc = await uploads_collection.find_one({"_id": doc_id, "user_id": user_id})
-                if chunk_doc and chunk_doc.get("usage_count", 0) < 3:
+                meta = upload_memory_map[idx]
+                usage_count = meta.get("usage_count", 0)
+                # Provide context up to a certain usage count, then remove from index to avoid repetition
+                if usage_count < 3:
+                    meta["usage_count"] = usage_count + 1
                     contexts.append(
-                        f"From uploaded {chunk_doc['modality']} '{chunk_doc['filename']}': {chunk_doc['chunk_text']}"
+                        f"Filename: {meta['filename']}\nModality: {meta['modality']}\nSnippet: {meta['text_snippet']}"
                     )
-                    new_usage_count = chunk_doc["usage_count"] + 1
-                    await uploads_collection.update_one(
-                        {"_id": doc_id},
-                        {"$set": {"usage_count": new_usage_count}}
-                    )
-                    if new_usage_count >= 3:
-                        to_remove.append(idx)
-        for idx in to_remove:
-            upload_index.remove_ids(np.array([idx], dtype="int64"))
-            del upload_memory_map[idx]
+                if meta.get("usage_count", 0) >= 3:
+                    del upload_memory_map[idx]
         return "\n\n".join(contexts)
     except Exception as e:
         logging.error(f"Error during multimodal retrieval: {e}", exc_info=True)
         return ""
 
-# Long-Term Memory Functions (unchanged)
+# -------------------------------------------------
+# Long-Term Memory Functions
+# -------------------------------------------------
 async def efficient_summarize(previous_summary: str, new_messages: list, user_id: str, max_summary_length: int = 500) -> str:
+    """
+    Summarize conversation history, including current goals/tasks, in a compact form.
+    """
     user_queries = "\n".join([msg["content"] for msg in new_messages if msg["role"] == "user"])
     context_text = f"User ID: {user_id}\n"
     if previous_summary:
         context_text += f"Previous Summary:\n{previous_summary}\n\n"
-    context_text += f"New User Queries:\n{user_queries}"
+    context_text += f"New User Queries:\n{user_queries}\n\n"
+
+    # Include current goals in the summary
+    active_goals = await goals_collection.find({"user_id": user_id, "status": "active"}).to_list(None)
+    goals_context = ""
+    if active_goals:
+        goals_context = "User's current goals and tasks:\n"
+        for goal in active_goals:
+            goals_context += f"- Goal: {goal['title']} ({goal['status']})\n"
+            for task in goal['tasks']:
+                goals_context += f"  - Task: {task['title']} ({task['status']})\n"
+    context_text += goals_context
+
     summary_prompt = (
-        f"Based on the following queries, generate a concise summary (max {max_summary_length} characters) that captures the user's interests and style:\n\n{context_text}"
+        f"Based on the following context, generate a concise summary (max {max_summary_length} characters) "
+        f"that captures the user's interests, style, and ongoing goals:\n\n{context_text}"
     )
     try:
         client = Groq(api_key=os.getenv("GROQ_API_KEY_MEMORY_SUMMARY"))
@@ -447,10 +509,14 @@ async def efficient_summarize(previous_summary: str, new_messages: list, user_id
         return previous_summary if previous_summary else "Summary unavailable."
 
 async def store_long_term_memory(user_id: str, session_id: str, new_messages: list):
+    """
+    Periodically store or update conversation summary in the long-term memory collection.
+    """
     try:
         mem_entry = await memory_collection.find_one({"user_id": user_id})
         previous_summary = mem_entry.get("summary", "") if mem_entry else ""
         new_summary = await efficient_summarize(previous_summary, new_messages, user_id)
+
         import openai
         openai.api_key = os.getenv("OPENAI_API_KEY")
         embedding_response = await openai.Embedding.acreate(input=new_summary, model="text-embedding-ada-002")
@@ -466,10 +532,12 @@ async def store_long_term_memory(user_id: str, session_id: str, new_messages: li
                     "timestamp": datetime.datetime.now(datetime.timezone.utc)
                 }}
             )
-            new_vector = np.array(new_vector, dtype="float32").reshape(1, -1)
-            llm_index.remove_ids(np.array([llm_memory_map[user_id]], dtype="int64")) if user_id in llm_memory_map else None
+            new_vector_np = np.array(new_vector, dtype="float32").reshape(1, -1)
+            # Remove old vector from FAISS if needed
+            if user_id in llm_memory_map:
+                llm_index.remove_ids(np.array([llm_memory_map[user_id]], dtype="int64"))
             idx = llm_index.ntotal
-            llm_index.add(new_vector)
+            llm_index.add(new_vector_np)
             llm_memory_map[user_id] = idx
         else:
             await memory_collection.insert_one({
@@ -479,22 +547,23 @@ async def store_long_term_memory(user_id: str, session_id: str, new_messages: li
                 "vector": new_vector,
                 "timestamp": datetime.datetime.now(datetime.timezone.utc)
             })
-            new_vector = np.array(new_vector, dtype="float32").reshape(1, -1)
+            new_vector_np = np.array(new_vector, dtype="float32").reshape(1, -1)
             idx = llm_index.ntotal
-            llm_index.add(new_vector)
+            llm_index.add(new_vector_np)
             llm_memory_map[user_id] = idx
+
         logging.info(f"Long-term memory updated for user {user_id}")
     except Exception as e:
         logging.error(f"Error storing long-term memory: {e}", exc_info=True)
 
+# -------------------------------------------------
 # Endpoints
+# -------------------------------------------------
 @app.post("/upload")
 async def upload_file(user_id: str = Form(...), files: list[UploadFile] = File(...)):
     """
-    Handle multi-modal file uploads by splitting text into chunks and storing each chunk.
-    - Text files (PDF, DOCX, TXT): Extract text and split into 500-char chunks with 100-char overlap.
-    - Images: Extract text (OCR or caption) and treat as one chunk.
-    - Store embeddings in FAISS and full chunk data in MongoDB.
+    Endpoint to handle file uploads (PDF, DOCX, TXT, images).
+    Extract text (via OCR or direct) and store embeddings in FAISS + MongoDB.
     """
     allowed_text_types = [
         "text/plain",
@@ -512,7 +581,6 @@ async def upload_file(user_id: str = Form(...), files: list[UploadFile] = File(.
                 continue
 
             extracted_text = ""
-            modality = "document" if file.content_type in allowed_text_types else "image"
             if file.content_type == "application/pdf":
                 extracted_text = await extract_text_from_pdf(file)
             elif file.content_type in ["application/msword", "application/vnd.openxmlformats-officedocument.wordprocessingml.document"]:
@@ -529,41 +597,55 @@ async def upload_file(user_id: str = Form(...), files: list[UploadFile] = File(.
                 responses.append({"filename": file.filename, "success": False})
                 continue
 
-            # Split text into chunks (images typically yield one chunk)
-            chunks = split_text(extracted_text)
-            for chunk in chunks:
-                embedding_vector = await generate_text_embedding(chunk)
-                if not embedding_vector:
-                    continue
-                doc = {
-                    "user_id": user_id,
-                    "filename": file.filename,
-                    "modality": modality,
-                    "chunk_text": chunk,
-                    "embedding": embedding_vector,
-                    "usage_count": 0,
-                    "timestamp": datetime.datetime.now(datetime.timezone.utc)
-                }
-                result = await uploads_collection.insert_one(doc)
-                doc_id = result.inserted_id
-                new_vector = np.array(embedding_vector, dtype="float32").reshape(1, -1)
-                new_id = upload_index.ntotal
-                upload_index.add(new_vector)
-                upload_memory_map[new_id] = doc_id
+            embedding_vector = await generate_text_embedding(extracted_text)
+            if not embedding_vector:
+                responses.append({"filename": file.filename, "success": False})
+                continue
+
+            new_vector = np.array(embedding_vector, dtype="float32").reshape(1, -1)
+            new_id = upload_index.ntotal
+            upload_index.add(new_vector)
+
+            modality = "document" if file.content_type in allowed_text_types else "image"
+            upload_memory_map[new_id] = {
+                "user_id": user_id,
+                "filename": file.filename,
+                "modality": modality,
+                "text_snippet": extracted_text[:200],
+                "usage_count": 0
+            }
+
+            await uploads_collection.insert_one({
+                "user_id": user_id,
+                "filename": file.filename,
+                "modality": modality,
+                "text_snippet": extracted_text[:500],
+                "embedding": embedding_vector,
+                "timestamp": datetime.datetime.now(datetime.timezone.utc)
+            })
 
             responses.append({"filename": file.filename, "success": True})
-            logging.info(f"File '{file.filename}' uploaded and chunked for user {user_id}")
+            logging.info(f"File '{file.filename}' uploaded for user {user_id}")
         except Exception as e:
             logging.error(f"Error processing file '{file.filename}': {e}", exc_info=True)
             responses.append({"filename": file.filename, "success": False})
+
     return {"results": responses}
+
 
 @app.post("/generate", response_model=GenerateResponse)
 async def generate_response(request: Request, background_tasks: BackgroundTasks):
     """
-    Generate a response with enhanced multi-modal context retrieval.
-    - Retrieve user-specific chunks from uploaded files.
-    - Include full chunk texts in the prompt for detailed responses.
+    Primary endpoint that:
+      - Receives user prompt
+      - Checks for goals/duplicates
+      - Parses bracketed markers to create/delete/update goals/tasks
+      - Optionally does web or multi-modal search
+      - Returns final LLM response
+
+    Now also handles new bracket markers for deadlines and progress:
+      [TASK_DEADLINE: <task_id>: <deadline>]
+      [TASK_PROGRESS: <task_id>: <progress_description>]
     """
     try:
         current_date = get_current_datetime()
@@ -573,6 +655,16 @@ async def generate_response(request: Request, background_tasks: BackgroundTasks)
 
         if not user_id or not session_id or not user_message:
             raise HTTPException(status_code=400, detail="Invalid request parameters.")
+
+        # Retrieve active goals for context
+        active_goals = await goals_collection.find({"user_id": user_id, "status": {"$in": ["active","in progress"]}}).to_list(None)
+        goals_context = ""
+        if active_goals:
+            goals_context = "User's current goals and tasks:\n"
+            for goal in active_goals:
+                goals_context += f"- Goal: {goal['title']} ({goal['status']}) [ID: {goal['goal_id']}]\n"
+                for task in goal['tasks']:
+                    goals_context += f"  - Task: {task['title']} ({task['status']}) [ID: {task['task_id']}]\n"
 
         # Extract external content if URL is provided
         external_content = ""
@@ -584,18 +676,18 @@ async def generate_response(request: Request, background_tasks: BackgroundTasks)
                 external_content = await extract_youtube_info_async(url)
                 external_content = await detailed_explanation(external_content)
             else:
-                external_content = await extract_web_content_async(url)
+                external_content = await scrape_url(url)
                 external_content = await content_for_website(external_content)
 
-        # Retrieve multi-modal context from user's uploaded files
-        multimodal_context = await retrieve_multimodal_context(user_message, user_id)
+        # Retrieve multi-modal context from uploaded files
+        multimodal_context = await retrieve_multimodal_context(user_message)
 
         # Construct unified prompt for the LLM
         unified_prompt = f"User Query: {user_message}\n"
         if external_content:
             unified_prompt += f"\n[External Content]:\n{external_content}\n"
         if multimodal_context:
-            unified_prompt += f"\n[Retrieved File Contexts]:\n{multimodal_context}\n"
+            unified_prompt += f"\n[Retrieved File Context]:\n{multimodal_context}\n"
         unified_prompt += f"\nCurrent Date/Time: {current_date}\n\nProvide a detailed and context-aware response."
 
         # Optionally determine if additional research is needed
@@ -613,18 +705,36 @@ async def generate_response(request: Request, background_tasks: BackgroundTasks)
         if mem_entry and "summary" in mem_entry:
             long_term_memory = mem_entry["summary"]
 
-        messages = [{
-            "role": "system",
-            "content": f"You are Stelle, a strategic, empathetic AI assistant. Provide thoughtful guidance blending conventional and unconventional solutions. Current date/time: {current_date}"
-        }]
+        # System prompt explaining bracketed markers for goals/tasks (including new ones!)
+        system_prompt = (
+            "You are Stelle, a strategic, empathetic AI assistant with goal/task management.\n"
+            "When the user sets a new goal, use '[GOAL_SET: <goal_title>]' plus optional '[TASK: <task_desc>]' lines.\n"
+            "To delete a goal: '[GOAL_DELETE: <goal_id>]'. To delete a task: '[TASK_DELETE: <task_id>]'.\n"
+            "To add a new task: '[TASK_ADD: <goal_id>: <task_description>]'.\n"
+            "To modify a task's title: '[TASK_MODIFY: <task_id>: <new_title_or_description>]'.\n"
+            "To start a goal: '[GOAL_START: <goal_id>]'. To start a task: '[TASK_START: <task_id>]'.\n"
+            "To complete a goal: '[GOAL_COMPLETE: <goal_id>]'. To complete a task: '[TASK_COMPLETE: <task_id>]'.\n"
+            "NEW: To set a deadline on a task: '[TASK_DEADLINE: <task_id>: <deadline>]' (any date/time format).\n"
+            "NEW: To log progress on a task: '[TASK_PROGRESS: <task_id>: <progress_description>]'.\n"
+            "Only use these bracketed markers if the user explicitly requests those actions.\n"
+            f"Current date/time: {current_date}\n"
+        )
+
+        messages = [{"role": "system", "content": system_prompt}]
         if long_term_memory:
             messages.append({"role": "system", "content": f"Long-term memory: {long_term_memory}"})
+        if goals_context:
+            messages.append({"role": "system", "content": goals_context})
         messages += chat_history
         messages.append({"role": "user", "content": unified_prompt})
         logging.info(f"LLM prompt messages: {messages}")
 
-        # Call the LLM via Groq API
+        # Call the LLM via Groq API (replace with your actual generation call)
         generate_api_keys = [os.getenv("GROQ_API_KEY_GENERATE_1"), os.getenv("GROQ_API_KEY_GENERATE_2")]
+        generate_api_keys = [k for k in generate_api_keys if k]  # filter out None
+        if not generate_api_keys:
+            raise HTTPException(status_code=500, detail="No valid GROQ_API_KEY_GENERATE environment variables found.")
+
         selected_key = random.choice(generate_api_keys)
         client_generate = Groq(api_key=selected_key)
         response = await asyncio.to_thread(
@@ -636,16 +746,258 @@ async def generate_response(request: Request, background_tasks: BackgroundTasks)
         )
         reply_content = response.choices[0].message.content.strip()
 
+        # -------------------------------------------------
+        # PARSE LLM OUTPUT FOR GOAL/TASK MANAGEMENT MARKERS
+        # -------------------------------------------------
+        # Track newly created goals so we can map user-supplied identifiers to real UUIDs
+        new_goals_map = {}
+
+        # 1) GOAL_SET: <goal_phrase>
+        goal_set_matches = re.findall(r"\[GOAL_SET: (.*?)\]", reply_content)
+        for goal_phrase in goal_set_matches:
+            # Create random goal_id
+            goal_id = str(uuid.uuid4())
+            # Map the user-supplied phrase to the real ID
+            new_goals_map[goal_phrase] = goal_id
+
+            # Check for duplicates (same title) - optional
+            existing_goal = await goals_collection.find_one({
+                "user_id": user_id,
+                "title": goal_phrase,
+                "status": {"$in": ["active", "in progress"]}
+            })
+            if existing_goal:
+                logging.info(f"Skipping creation of duplicate goal '{goal_phrase}' for user {user_id}.")
+                continue
+
+            new_goal = {
+                "user_id": user_id,
+                "goal_id": goal_id,
+                "title": goal_phrase,
+                "description": "",
+                "status": "active",  # new goals default to 'active'
+                "created_at": datetime.datetime.now(datetime.timezone.utc),
+                "updated_at": datetime.datetime.now(datetime.timezone.utc),
+                "tasks": []
+            }
+            # If the LLM included [TASK: ...] lines for immediate tasks under this goal
+            task_matches = re.findall(r"\[TASK: (.*?)\]", reply_content)
+            for task_desc in task_matches:
+                task_id = str(uuid.uuid4())
+                new_task = {
+                    "task_id": task_id,
+                    "title": task_desc,
+                    "description": "",
+                    "status": "not started",
+                    "created_at": datetime.datetime.now(datetime.timezone.utc),
+                    "updated_at": datetime.datetime.now(datetime.timezone.utc),
+                    "deadline": None,
+                    "progress": []
+                }
+                new_goal["tasks"].append(new_task)
+
+            await goals_collection.insert_one(new_goal)
+            logging.info(f"Goal set: '{goal_phrase}' with {len(task_matches)} tasks for user {user_id}")
+
+        # 2) GOAL_DELETE: <goal_id>
+        goal_delete_matches = re.findall(r"\[GOAL_DELETE: (.*?)\]", reply_content)
+        for gid in goal_delete_matches:
+            real_goal_id = new_goals_map.get(gid, gid)
+            result = await goals_collection.delete_one({"user_id": user_id, "goal_id": real_goal_id})
+            if result.deleted_count > 0:
+                logging.info(f"Goal {real_goal_id} deleted for user {user_id}")
+            else:
+                logging.warning(f"Goal {real_goal_id} not found or could not be deleted.")
+
+        # 3) TASK_DELETE: <task_id>
+        task_delete_matches = re.findall(r"\[TASK_DELETE: (.*?)\]", reply_content)
+        for tid in task_delete_matches:
+            result = await goals_collection.update_one(
+                {"user_id": user_id, "tasks.task_id": tid},
+                {"$pull": {"tasks": {"task_id": tid}}}
+            )
+            if result.modified_count > 0:
+                logging.info(f"Task {tid} deleted for user {user_id}")
+            else:
+                logging.warning(f"Task {tid} not found or could not be deleted.")
+
+        # 4) TASK_ADD: <goal_id>: <task_description>
+        task_add_matches = re.findall(r"\[TASK_ADD:\s*(.*?):\s*(.*?)\]", reply_content)
+        for goal_id_str, task_desc in task_add_matches:
+            real_goal_id = new_goals_map.get(goal_id_str, goal_id_str)
+            task_id = str(uuid.uuid4())
+            new_task = {
+                "task_id": task_id,
+                "title": task_desc,
+                "description": "",
+                "status": "not started",
+                "created_at": datetime.datetime.now(datetime.timezone.utc),
+                "updated_at": datetime.datetime.now(datetime.timezone.utc),
+                "deadline": None,
+                "progress": []
+            }
+            result = await goals_collection.update_one(
+                {"user_id": user_id, "goal_id": real_goal_id},
+                {
+                    "$push": {"tasks": new_task},
+                    "$set": {"updated_at": datetime.datetime.now(datetime.timezone.utc)}
+                }
+            )
+            if result.modified_count > 0:
+                logging.info(f"Added task '{task_desc}' to goal {real_goal_id}")
+            else:
+                logging.warning(f"Could not add task to goal {real_goal_id} (not found?).")
+
+        # 5) TASK_MODIFY: <task_id>: <new_description>
+        task_modify_matches = re.findall(r"\[TASK_MODIFY:\s*(.*?):\s*(.*?)\]", reply_content)
+        for tid, new_desc in task_modify_matches:
+            result = await goals_collection.update_one(
+                {"user_id": user_id, "tasks.task_id": tid},
+                {
+                    "$set": {
+                        "tasks.$.title": new_desc,
+                        "tasks.$.updated_at": datetime.datetime.now(datetime.timezone.utc)
+                    }
+                }
+            )
+            if result.modified_count > 0:
+                logging.info(f"Task {tid} modified to '{new_desc}'")
+            else:
+                logging.warning(f"Task {tid} not found for modification.")
+
+        # 6) GOAL_START: <goal_id> → set status to "in progress"
+        goal_start_matches = re.findall(r"\[GOAL_START: (.*?)\]", reply_content)
+        for gid in goal_start_matches:
+            real_goal_id = new_goals_map.get(gid, gid)
+            result = await goals_collection.update_one(
+                {"user_id": user_id, "goal_id": real_goal_id},
+                {"$set": {"status": "in progress", "updated_at": datetime.datetime.now(datetime.timezone.utc)}}
+            )
+            if result.modified_count > 0:
+                logging.info(f"Goal {real_goal_id} started (in progress).")
+            else:
+                logging.warning(f"Goal {real_goal_id} not found for GOAL_START.")
+
+        # 7) TASK_START: <task_id> → set status to "in progress"
+        task_start_matches = re.findall(r"\[TASK_START: (.*?)\]", reply_content)
+        for tid in task_start_matches:
+            result = await goals_collection.update_one(
+                {"user_id": user_id, "tasks.task_id": tid},
+                {
+                    "$set": {
+                        "tasks.$.status": "in progress",
+                        "tasks.$.updated_at": datetime.datetime.now(datetime.timezone.utc)
+                    }
+                }
+            )
+            if result.modified_count > 0:
+                logging.info(f"Task {tid} started (in progress).")
+            else:
+                logging.warning(f"Task {tid} not found for TASK_START.")
+
+        # 8) GOAL_COMPLETE: <goal_id> → set status to "completed"
+        goal_complete_matches = re.findall(r"\[GOAL_COMPLETE: (.*?)\]", reply_content)
+        for gid in goal_complete_matches:
+            real_goal_id = new_goals_map.get(gid, gid)
+            result = await goals_collection.update_one(
+                {"user_id": user_id, "goal_id": real_goal_id},
+                {"$set": {"status": "completed", "updated_at": datetime.datetime.now(datetime.timezone.utc)}}
+            )
+            if result.modified_count > 0:
+                logging.info(f"Goal {real_goal_id} marked as completed.")
+            else:
+                logging.warning(f"Goal {real_goal_id} not found for GOAL_COMPLETE.")
+
+        # 9) TASK_COMPLETE: <task_id>
+        task_complete_matches = re.findall(r"\[TASK_COMPLETE: (.*?)\]", reply_content)
+        for tid in task_complete_matches:
+            result = await goals_collection.update_one(
+                {"user_id": user_id, "tasks.task_id": tid},
+                {
+                    "$set": {
+                        "tasks.$.status": "completed",
+                        "tasks.$.updated_at": datetime.datetime.now(datetime.timezone.utc)
+                    }
+                }
+            )
+            if result.modified_count > 0:
+                logging.info(f"Task {tid} marked as completed.")
+            else:
+                logging.warning(f"Task {tid} not found for completion.")
+
+        # ---------------------------------------
+        # NEW 10) TASK_DEADLINE: <task_id>: <deadline>
+        # ---------------------------------------
+        task_deadline_matches = re.findall(r"\[TASK_DEADLINE:\s*(.*?):\s*(.*?)\]", reply_content)
+        for tid, deadline_str in task_deadline_matches:
+            # In production, you might parse/validate date strings, e.g. with dateutil.
+            # For now, store as a string or attempt parse:
+            try:
+                # Example parse attempt (if you want an actual datetime object):
+                # from dateutil.parser import parse
+                # parsed_deadline = parse(deadline_str)
+                # deadline_value = parsed_deadline
+                # If parse fails, store as string:
+                # ...
+                deadline_value = deadline_str  # or the parsed datetime
+            except Exception:
+                deadline_value = deadline_str
+
+            result = await goals_collection.update_one(
+                {"user_id": user_id, "tasks.task_id": tid},
+                {
+                    "$set": {
+                        "tasks.$.deadline": deadline_value,
+                        "tasks.$.updated_at": datetime.datetime.now(datetime.timezone.utc)
+                    }
+                }
+            )
+            if result.modified_count > 0:
+                logging.info(f"Set deadline for Task {tid} to {deadline_value}")
+            else:
+                logging.warning(f"Task {tid} not found for deadline update.")
+
+        # ---------------------------------------
+        # NEW 11) TASK_PROGRESS: <task_id>: <progress_description>
+        # ---------------------------------------
+        task_progress_matches = re.findall(r"\[TASK_PROGRESS:\s*(.*?):\s*(.*?)\]", reply_content)
+        for tid, progress_desc in task_progress_matches:
+            progress_entry = {
+                "timestamp": datetime.datetime.now(datetime.timezone.utc),
+                "description": progress_desc
+            }
+            result = await goals_collection.update_one(
+                {"user_id": user_id, "tasks.task_id": tid},
+                {
+                    "$push": {"tasks.$.progress": progress_entry},
+                    "$set": {"tasks.$.updated_at": datetime.datetime.now(datetime.timezone.utc)}
+                }
+            )
+            if result.modified_count > 0:
+                logging.info(f"Added progress entry to Task {tid}: {progress_desc}")
+            else:
+                logging.warning(f"Task {tid} not found for progress update.")
+
+        # -------------------------------------------------
+        # CLEAN THE FINAL REPLY FOR THE USER
+        # -------------------------------------------------
+        # Remove bracketed lines from the final user-facing message:
+        lines = reply_content.split("\n")
+        clean_lines = [line for line in lines if not re.match(r"\[.*?: .*?\]", line.strip())]
+        reply_content_clean = "\n".join(clean_lines).strip()
+
         # Update chat history in MongoDB
         new_messages = [
             {"role": "user", "content": user_message},
-            {"role": "assistant", "content": reply_content}
+            {"role": "assistant", "content": reply_content_clean}
         ]
         if chat_entry:
             await chats_collection.update_one(
                 {"user_id": user_id, "session_id": session_id},
-                {"$push": {"messages": {"$each": new_messages}},
-                 "$set": {"last_updated": datetime.datetime.now(datetime.timezone.utc)}}
+                {
+                    "$push": {"messages": {"$each": new_messages}},
+                    "$set": {"last_updated": datetime.datetime.now(datetime.timezone.utc)}
+                }
             )
         else:
             await chats_collection.insert_one({
@@ -659,13 +1011,18 @@ async def generate_response(request: Request, background_tasks: BackgroundTasks)
         if chat_entry and len(chat_entry.get("messages", [])) >= 10:
             background_tasks.add_task(store_long_term_memory, user_id, session_id, chat_entry["messages"][-10:])
 
-        return GenerateResponse(response=reply_content)
+        return GenerateResponse(response=reply_content_clean)
+
     except Exception as e:
         logging.error(f"Error in /generate endpoint: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail="Internal error processing your request.")
 
+
 @app.get("/chat-history")
 async def get_chat_history(user_id: str = Query(...), session_id: str = Query(...)):
+    """
+    Retrieve filtered chat history (omitting <think> ... </think> content).
+    """
     try:
         chat_entry = await chats_collection.find_one({"user_id": user_id, "session_id": session_id}, {"messages": 1})
         if chat_entry and "messages" in chat_entry:
@@ -675,67 +1032,43 @@ async def get_chat_history(user_id: str = Query(...), session_id: str = Query(..
         logging.error(f"Chat history retrieval error: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail="Error retrieving chat history.")
 
-@app.post("/browse", response_model=BrowseResponse)
-async def browse_internet(request: Request):
-    try:
-        current_date = get_current_datetime()
-        data = await request.json()
-        req = BrowseRequest(**data)
-        query = f"{req.query.strip()} Today’s date/time is: {current_date}"
-        if re.search(r'https?://[^\s]+', req.query):
-            if "youtube.com" in req.query or "youtu.be" in req.query:
-                raw_content = await extract_youtube_info_async(req.query)
-            else:
-                raw_content = await extract_web_content_async(req.query)
-        else:
-            raw_content = await free_search(query)
-        llm_prompt = (
-            f"User Query: {query}\n\nExtracted Content:\n{raw_content}\n\n"
-            "Provide a detailed and insightful response that addresses the query."
-        )
-        client_browse = Groq(api_key=os.getenv("GROQ_API_KEY_BROWSE_ENDPOINT"))
-        llm_response = await asyncio.to_thread(
-            client_browse.chat.completions.create,
-            messages=[
-                {"role": "system", "content": "You are Stelle, an advanced assistant skilled in content analysis."},
-                {"role": "user", "content": llm_prompt}
-            ],
-            model="deepseek-r1-distill-qwen-32b",
-            max_tokens=1500,
-            temperature=0.7,
-        )
-        final_output = llm_response.choices[0].message.content.strip()
-        logging.info(f"/browse endpoint LLM response (first 300 chars): {final_output[:300]}...")
-        return BrowseResponse(result=final_output)
-    except Exception as e:
-        logging.error(f"Browse endpoint error: {e}", exc_info=True)
-        raise HTTPException(status_code=500, detail="Internal error during browsing.")
-        
-@app.get("/history")
-async def get_history(user_id: str = Query(...)):
+
+@app.get("/get-goals")
+async def get_goals(user_id: str = Query(...)):
     """
-    Retrieve all session IDs for the given user along with only the first message of each conversation.
+    Retrieve all goals and their tasks for a given user, with date fields serialized.
     """
     try:
-        # Find all chat sessions for the user
-        sessions = await chats_collection.find({"user_id": user_id}).to_list(None)
-        history = []
-        for session in sessions:
-            session_id = session.get("session_id")
-            messages = session.get("messages", [])
-            # Filter messages to remove any <think> tags if necessary
-            filtered_messages = filter_think_messages(messages)
-            first_message = filtered_messages[0]["content"] if filtered_messages else ""
-            history.append({
-                "session_id": session_id,
-                "first_message": first_message
-            })
-        return {"history": history}
+        goals = await goals_collection.find({"user_id": user_id}).to_list(None)
+        if not goals:
+            return {"goals": []}
+        # Convert ObjectIds and datetime objects for JSON serialization
+        for goal in goals:
+            goal = convert_object_ids(goal)
+            goal["created_at"] = goal["created_at"].isoformat()
+            goal["updated_at"] = goal["updated_at"].isoformat()
+            for task in goal["tasks"]:
+                if "_id" in task:
+                    task["_id"] = str(task["_id"])
+                task["created_at"] = task["created_at"].isoformat()
+                task["updated_at"] = task["updated_at"].isoformat()
+                if task.get("deadline"):
+                    # If you store deadlines as strings or datetimes, adapt accordingly
+                    if isinstance(task["deadline"], datetime.datetime):
+                        task["deadline"] = task["deadline"].isoformat()
+                    else:
+                        task["deadline"] = str(task["deadline"])
+                for progress in task.get("progress", []):
+                    progress["timestamp"] = progress["timestamp"].isoformat()
+        return {"goals": goals}
     except Exception as e:
-        logging.error(f"Error retrieving session history: {e}", exc_info=True)
-        raise HTTPException(status_code=500, detail="Error retrieving session history.")
+        logging.error(f"Error retrieving goals for user {user_id}: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail="Error retrieving goals.")
 
 
+# -------------------------------------------------
+# Run the Application (for local dev)
+# -------------------------------------------------
 if __name__ == '__main__':
     import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=8000, reload=True)
