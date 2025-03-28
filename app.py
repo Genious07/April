@@ -1065,6 +1065,30 @@ async def get_goals(user_id: str = Query(...)):
         logging.error(f"Error retrieving goals for user {user_id}: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail="Error retrieving goals.")
 
+@app.get("/history")
+async def get_history(user_id: str = Query(...)):
+    """
+    Retrieve all session IDs for the given user along with only the first message of each conversation.
+    """
+    try:
+        # Find all chat sessions for the user
+        sessions = await chats_collection.find({"user_id": user_id}).to_list(None)
+        history = []
+        for session in sessions:
+            session_id = session.get("session_id")
+            messages = session.get("messages", [])
+            # Filter messages to remove any <think> tags if necessary
+            filtered_messages = filter_think_messages(messages)
+            first_message = filtered_messages[0]["content"] if filtered_messages else ""
+            history.append({
+                "session_id": session_id,
+                "first_message": first_message
+            })
+        return {"history": history}
+    except Exception as e:
+        logging.error(f"Error retrieving session history: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail="Error retrieving session history.")
+
 
 # -------------------------------------------------
 # Run the Application (for local dev)
