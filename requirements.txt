@@ -82,6 +82,21 @@ transformers
 faiss-cpu         # or 'faiss-gpu' if you plan to use a GPU version
 python-multipart
 numpy
+fastapi
+uvicorn
+pydantic
+motor
+dotenv
+beautifulsoup4
+youtube_transcript_api
+httpx
+faiss
+numpy
+Pillow
+easyocr
+torch
+transformers
+groq
 groq
 
 
